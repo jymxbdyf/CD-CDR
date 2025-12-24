@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # Ref: Generate What You Prefer: Reshaping Sequential Recommendation via Guided Diffusion (NIPS 23' DreamRec)
+# after SIGIR 25, additional ref on the DDIM process: AlphaFuse: Learn ID Embeddings for Sequential Recommendation in Null Space of Language Embeddings (SIGIR 25' AlphaFuse)
 
 r"""
 CDCDR
@@ -16,18 +17,6 @@ from torch.nn.init import xavier_normal_, constant_, normal_
 from recbole.model.loss import BPRLoss
 from recbole.utils import InputType
 from CDCDR.model.crossdomain_recommender import CrossDomainRecommender
-
-def diffusion_initialization(module):
-    r"""using `xavier_normal_`_ in PyTorch to initialize the parameters in
-    nn.Linear layers. For bias in nn.Linear layers, using constant 0 to initialize.
-    Use normal_ for embeddings.
-    """
-    if isinstance(module, nn.Embedding):
-        normal_(module.weight.data, 0, 1)
-    elif isinstance(module, nn.Linear):
-        xavier_normal_(module.weight.data)
-        if module.bias is not None:
-            constant_(module.bias.data, 0)
 
 ## Edit from DreamRec
 def extract(a, t, x_shape):
@@ -77,18 +66,16 @@ def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
 
 def build_history_matrix(inter_feat, max_history_len=None):
     """
-    构建用户历史交互矩阵，固定使用 'timestamp' 作为值。
-
     Args:
-        inter_feat (pd.DataFrame): 包含 'user_id', 'item_id', 'timestamp' 的交互数据。
-        user_num (int): 用户总数（用户 ID 范围为 [0, user_num)）。
-        max_history_len (int, optional): 历史序列最大长度。若为 None，则用实际最大长度。
+        inter_feat (pd.DataFrame): include 'user_id', 'item_id', 'timestamp'
+        user_num (int): user_id in [0, user_num)
+        max_history_len (int, optional): maximum length of history sequence
 
     Returns:
         tuple: (history_matrix, history_values, history_lengths)
-            - history_matrix: [user_num, L] 的 item_id 序列（LongTensor）
-            - history_values: [user_num, L] 的 timestamp 序列（FloatTensor）
-            - history_lengths: [user_num] 每个用户的实际历史长度（LongTensor）
+            - history_matrix: [user_num, L]
+            - history_values: [user_num, L], timestamp 
+            - history_lengths: [user_num]
     """
     user_num = 0
     inter_df = []
@@ -100,10 +87,9 @@ def build_history_matrix(inter_feat, max_history_len=None):
         df = pd.DataFrame({
             'user_id': uid.cpu().numpy(),
             'item_id': iid.cpu().numpy(),
-            'timestamp': ts.cpu().numpy().astype('float32')  # 显式 float32
+            'timestamp': ts.cpu().numpy().astype('float32')
         })
 
-        # 排序并保留最近的 max_history_len 条
         df = df.sort_values(['user_id', 'timestamp'])
         if max_history_len is not None:
             df = df.groupby('user_id').tail(max_history_len)
@@ -119,15 +105,12 @@ def build_history_matrix(inter_feat, max_history_len=None):
         L = max_history_len
         L = max(1, L)
 
-        # 初始化输出张量
         H = torch.zeros(user_num, L, dtype=torch.int64)
         V = torch.zeros(user_num, L, dtype=torch.float32)  # float32!
         lens = torch.zeros(user_num, dtype=torch.int64)
 
-        # 批量填充：按用户分组，整片赋值（避免逐元素）
         for user, group in df.groupby('user_id'):
             k = min(len(group), L)
-            # 关键：用 torch.from_numpy + .to(torch.float32) 确保类型匹配
             H[user, :k] = torch.from_numpy(group['item_id'].values[:k])
             V[user, :k] = torch.from_numpy(group['timestamp'].values[:k]).to(torch.float32)
             lens[user] = k
@@ -137,39 +120,15 @@ def build_history_matrix(inter_feat, max_history_len=None):
 
     return torch.stack(Hs, dim=0), torch.stack(Vs, dim=0), torch.stack(lens_list, dim=0)
 
-def temporal_mask_history(history_item, history_timestamp, history_len, current_timestamp):
-    """
-    Args:
-        history_item:       [B, L] int64
-        history_timestamp:  [B, L] float32
-        history_len:        [B]    int64
-        current_timestamp:  [B]    float32  (当前交互的时间戳)
-
-    Returns:
-        masked_item: [B, L] int64  (未来部分置0)
-        new_len:     [B]    int64  (裁剪后的真实长度)
-    """
-    B, L = history_item.shape
-
-    valid_mask = torch.arange(L, device=history_item.device).unsqueeze(0) < history_len.unsqueeze(1)  # [B, L]
-    time_mask = history_timestamp < current_timestamp.unsqueeze(1)  # [B, L]
-    final_mask = valid_mask & time_mask  # [B, L]
-    new_len = final_mask.sum(dim=1)  # [B]
-    masked_item = history_item * final_mask  # [B, L]
-
-    return masked_item, new_len
-
 def remove_pos_from_history(pos_item, history_item, history_len):
-    """
-    从历史记录中移除正样本项（pos_item），并更新历史长度。
-    
+    """    
     Args:
         pos_item: [B]
         history_item: [B, L]
         history_len: [B]
     
     Returns:
-        filtered_history_item: [B, L]（移除 pos_item 后，用 0 填充）
+        filtered_history_item: [B, L]
         updated_history_len: [B]
     """
     pos_item_expanded = pos_item.unsqueeze(1)  # [B, 1]
@@ -202,7 +161,8 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
 
 class CDCDR(CrossDomainRecommender):
-    r"""CDCDR, implemented based on the aggregation mechanism of simplex and diffusion mechanism of DreamRec
+    r"""
+    CDCDR
     """
     input_type = InputType.PAIRWISE
 
@@ -210,7 +170,6 @@ class CDCDR(CrossDomainRecommender):
         super(CDCDR, self).__init__(config, dataset)
 
         # Get user history interacted items
-        #self.history_item_id, _, self.history_item_len = dataset.history_item_matrix(max_history_len=config["history_len"])
         both_domain_inter_feat = {
             "source_user_id": dataset.source_domain_dataset.inter_feat["source_user_id"],
             "source_item_id": dataset.source_domain_dataset.inter_feat["source_item_id"],
@@ -223,7 +182,6 @@ class CDCDR(CrossDomainRecommender):
             max_history_len=config["history_len"]
         )
 
-        # 注册为 buffer，确保随模型移动到 GPU
         self.register_buffer("history_item_id", history_item_id)
         self.register_buffer("history_timestamp", history_timestamp)
         self.register_buffer("history_item_len", history_item_len)
@@ -235,20 +193,15 @@ class CDCDR(CrossDomainRecommender):
         #self.negative_weight = config["negative_weight"]
         self.gamma = config["gamma"]
         self.neg_seq_len = config["train_neg_sample_args"]["sample_num"]
-        #self.reg_weight = config["reg_weight"]
         self.aggregator = config["aggregator"]
         self.loss_n = config["loss_n"]
         if self.aggregator not in ["mean", "user_attention", "self_attention", "transformer"]:
             raise ValueError(
                 "aggregator must be mean, user_attention, self_attention or transformer"
             )
-        # Transformer聚合器特有参数
         if self.aggregator == "transformer":
             self.n_heads = config["n_heads"]
             self.dropout_prob = config["dropout"]
-            # 位置编码
-            #self.position_embedding = nn.Embedding(config["history_len"], self.embedding_size)
-            # Transformer编码层
             self.transformer_layer = nn.TransformerEncoderLayer(
                 d_model=self.embedding_size,
                 nhead=self.n_heads,
@@ -276,7 +229,7 @@ class CDCDR(CrossDomainRecommender):
             num_heads=self.n_heads,
             batch_first=True
         )
-        self.gate_proj = nn.Linear(2 * self.embedding_size, self.embedding_size)
+        self.gate_proj = nn.Linear(2 * self.embedding_size, 1)
         nn.init.constant_(self.gate_proj.bias, 0.0)
 
         # feature space mapping matrix of user and item
@@ -295,7 +248,6 @@ class CDCDR(CrossDomainRecommender):
             self.UI_map = nn.Identity()
             self.mean_pooling = config["mean_pooling"]
 
-        self.simple = config['simple']
         self.sigmoid = nn.Sigmoid()
         self.bprloss = BPRLoss()
         self.bceloss = nn.BCELoss()
@@ -303,7 +255,6 @@ class CDCDR(CrossDomainRecommender):
 
         ## Edit from DreamRec
         self.diffuser_type = config["diffuser_type"]
-        self.loss_type = config["loss_type"]
         self.timesteps = config['timestep'] # 200, diffusion steps
         self.linespace = 100
         self.w = config['uncon_w'] # 2, the weight of conditioned diffusion in inference phase
@@ -360,7 +311,7 @@ class CDCDR(CrossDomainRecommender):
         self.posterior_mean_coef2 = (1. - self.alphas_cumprod_prev) * torch.sqrt(self.alphas) / (1. - self.alphas_cumprod)
         self.posterior_variance = self.betas * (1. - self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
 
-        # DDIM Reverse Process
+        # DDIM Reverse Process, edit from alphafuse
         indices = list(range(0, self.timesteps+1, self.linespace)) # [0,100,...,2000]
         self.sub_timesteps = len(indices)
         indices_now = [indices[i]-1 for i in range(len(indices))]
@@ -372,15 +323,11 @@ class CDCDR(CrossDomainRecommender):
         self.posterior_ddim_coef2 = torch.sqrt(1.-self.alphas_cumprod_ddim_prev) / torch.sqrt(1. - self.alphas_cumprod_ddim)
 
         # parameters initialization
-        if self.simple:
-            self.apply(xavier_normal_initialization)
-        else:
-            self.apply(diffusion_initialization)
+        self.apply(xavier_normal_initialization)
         # get the mask
         self.item_emb.weight.data[0, :] = 0
 
     ## Edit from DreamRec
-    # pertube_item, pertube
     def q_sample(self, x_start, t, noise=None): # add noise to x_start according to a series of timestamp t
         # print(self.betas)
         if noise is None:
@@ -410,7 +357,6 @@ class CDCDR(CrossDomainRecommender):
 
             return model_mean + torch.sqrt(posterior_variance_t) * noise
 
-    # DreamRec_backbone i_sample
     @torch.no_grad()
     def i_sample(self, model_forward, model_forward_uncon, x, h, t, t_index):
         # cf guidance
@@ -425,7 +371,6 @@ class CDCDR(CrossDomainRecommender):
 
         return model_mean 
         
-    # DreamRec_backbone sample_from_noise
     @torch.no_grad()
     def sample_from_noise(self, model_forward, model_forward_uncon, h):
 
@@ -439,13 +384,11 @@ class CDCDR(CrossDomainRecommender):
         return x
 
     ## Edit from DreamRec
-    # DreamRec_backbone forward
     def denoise_step(self, x, h, step):
         t = self.step_mlp(step)
         res = self.diffu_mlp(torch.cat((x, h, t), dim=1))
         return res
-    # DreamRec_backbone forward_uncon
-    def denoise_uncon(self, x, step): # with out condition
+    def denoise_uncon(self, x, step):
         h = self.none_embedding(torch.tensor([0], device = self.device))
         h = torch.cat([h.view(1, self.embedding_size)]*x.shape[0], dim=0)
 
@@ -456,7 +399,7 @@ class CDCDR(CrossDomainRecommender):
 
     def get_user_representation(self, user, history_item, history_len):
         """
-        计算用户聚合表征 UI_aggregation_e。
+        calculate UI_aggregation_e。
         
         Args:
             user: [B]
@@ -487,7 +430,7 @@ class CDCDR(CrossDomainRecommender):
             pos_item_sum = history_item_e.sum(dim=1)
             # [user_num, embedding_size]
             out = pos_item_sum / (history_len + 1.e-10).unsqueeze(1)
-        elif self.aggregator in ["user_attention", "self_attention"]: #residual？
+        elif self.aggregator in ["user_attention", "self_attention"]:
             mask = (torch.abs(history_item_e).sum(dim=-1) > 1e-8).int()
             history_item_e = self.ln_1(history_item_e) # [user_num, max_history_len, embedding_size]
             key = self.W_k(history_item_e)
@@ -501,20 +444,12 @@ class CDCDR(CrossDomainRecommender):
 
             attention_weight = e_attention / (e_attention.sum(dim=1, keepdim=True) + 1.0e-10)
             out = torch.matmul(attention_weight.unsqueeze(1), history_item_e).squeeze(1)
-            #out = self.ln_2(out) #TODO:在后面加LN
+            #out = self.ln_2(out)
         elif self.aggregator == "transformer":
-            mask = torch.abs(history_item_e).sum(dim=-1) < 1e-8  # 填充位置为True
+            mask = torch.abs(history_item_e).sum(dim=-1) < 1e-8
             fully_padded = mask.all(dim=1)
             mask[fully_padded, 0] = False
             transformer_input = history_item_e
-            """
-            # 生成位置编码
-            positions = torch.arange(history_item_e.size(1), device=self.device).expand(history_item_e.size(0), -1)
-            pos_embedding = self.position_embedding(positions)
-            
-            # 添加位置编码并应用Transformer
-            transformer_input = transformer_input + pos_embedding
-            """
             transformer_input = self.ln_1(transformer_input)
             transformer_input = self.emb_dropout(transformer_input)
             transformer_output = self.transformer_encoder(
@@ -522,67 +457,37 @@ class CDCDR(CrossDomainRecommender):
                 src_key_padding_mask=mask
             )
             if self.mean_pooling:
-                # 生成有效位置mask并计算均值
-                mask = ~mask.unsqueeze(-1)  # 有效位置为True [B, L, 1]
-                masked_output = transformer_output * mask.float()       # 将padding位置置零
-                sum_output = masked_output.sum(dim=1)                   # 按序列维度求和 [B, D]
-                valid_length = history_len.unsqueeze(1).float()         # 有效序列长度 [B, 1]
-                out = sum_output / (valid_length + 1e-10)               # 平均池化
+                mask = ~mask.unsqueeze(-1)  # [B, L, 1]
+                masked_output = transformer_output * mask.float()
+                sum_output = masked_output.sum(dim=1)
+                valid_length = history_len.unsqueeze(1).float()
+                out = sum_output / (valid_length + 1e-10)
             else:
-                # 找到每个序列中最后一个True的位置（即最后一个有效项的位置）
                 last_valid_pos = (mask.size(1) - 1) - mask.flip(dims=[1]).int().argmin(dim=1)  # [batch_size]
-                # 处理全为True的情况（无有效项）
                 last_valid_pos[mask.all(dim=1)] = 0
                 out = gather_indexes(transformer_output, last_valid_pos)
         # Combined vector of user and item sequences
         out = self.UI_map(out)
-        UI_aggregation_e = self.gamma * user_e + (1 - self.gamma) * out #simplex也是out的绝对值0.5，user的绝对值0.0294，试试g=0试试
+        UI_aggregation_e = self.gamma * user_e + (1 - self.gamma) * out
         #UI_aggregation_e = self.ln_2(UI_aggregation_e)
         return UI_aggregation_e
 
-    def get_cos(self, user_e, item_e):
-        r"""Get the cosine similarity between user and item
-
-        Args:
-            user_e (torch.Tensor): User's feature vector, shape: [user_num, embedding_size]
-            item_e (torch.Tensor): Item's feature vector,
-                shape: [user_num, item_num, embedding_size]
-
-        Returns:
-            torch.Tensor: Cosine similarity between user and item, shape: [user_num, item_num]
-        """
-        user_e = F.normalize(user_e, dim=1)
-        # [user_num, embedding_size, 1]
-        user_e = user_e.unsqueeze(2)
-        item_e = F.normalize(item_e, dim=2)
-        UI_cos = torch.matmul(item_e, user_e)
-        return UI_cos.squeeze(2)
-
     def run_diffusion_process(self, target_item_emb, condition_emb):
         """
-        执行扩散模型的前向加噪与去噪预测。
-        
         Args:
             target_item_emb: x_start, [B, D]
             condition_emb: h (condition), [B, D]
         
         Returns:
-            x_start: 原始目标嵌入 [B, D]
-            predicted_x: 模型预测的去噪结果 [B, D]
+            x_start: [B, D]
+            predicted_x: [B, D]
         """
         B = target_item_emb.shape[0]
         n = torch.randint(0, self.timesteps, (B,), device=self.device).long()  # [B]
         noise = torch.randn_like(target_item_emb)  # [B, D]
-        
-        # 加噪
         x_noisy = self.q_sample(x_start=target_item_emb, t=n, noise=noise)  # [B, D]
-        
-        # 条件注入（如 DreamRec 中的 unconditional mixing）
         h = self.add_uncon(condition_emb)  # [B, D]
-        
-        # 去噪预测
         predicted_x = self.denoise_step(x=x_noisy, h=h, step=n)  # [B, D]
-        
         return target_item_emb, predicted_x
 
     def add_uncon(self, h):
@@ -592,38 +497,41 @@ class CDCDR(CrossDomainRecommender):
         mask = torch.cat([maske1d] * D, dim=1)
         mask = mask.to(self.device)
 
-        # print(h.device, self.none_embedding(torch.tensor([0]).to(self.device)).device, mask.device)
         h = h * mask + self.none_embedding(torch.tensor([0], device = self.device)) * (1-mask)
         return h
 
-    def domain_condition_generator(self, UI_aggregation_e, domain):
+    def domain_condition_generator(self, s_UI_aggregation_e, t_UI_aggregation_e, domain):
         """
-        使用可学习的 domain embedding 作为 Q，UI_aggregation_e 作为 K=V，
-        执行 batch-first MultiheadAttention。
+        domain embedding as Q, UI_aggregation_e as K=V
         
         Args:
-            UI_aggregation_e: [B, D]
-            domain: [B,]  (e.g., 0 or 1)
+            s_UI_aggregation_e: [B, D]
+            t_UI_aggregation_e: [B, D]
+            domain: scalar (e.g. 0 or 1)
         
         Returns:
-            [B, D] — 注意力输出
+            [B, D]
         """
-        """if 1:
-            output = UI_aggregation_e.unsqueeze(1) * domain  # [B, 1, D]
-        else:"""
+
         if 1:
-            Q = self.domain_emb(domain).unsqueeze(1)      # [B, 1, D]
+            UI_aggregation_e = t_UI_aggregation_e if domain ==1 else s_UI_aggregation_e
+            return UI_aggregation_e
+        else:
+            gate_input = torch.cat([s_UI_aggregation_e, t_UI_aggregation_e], dim=-1)
+            gate = torch.sigmoid(self.gate_proj(gate_input))  # [B, D] 或 [B, 1]
+            UI_aggregation_e = gate * s_UI_aggregation_e + (1 - gate) * t_UI_aggregation_e  # [B, D]
+            
+            domain_idx = (torch.ones([s_UI_aggregation_e.shape[0]], device=s_UI_aggregation_e.device) * domain).int()  # [B], e.g., all 0 for source
+            """Q = self.domain_emb(domain_idx).unsqueeze(1)      # [B, 1, D]
             K = V = UI_aggregation_e.unsqueeze(1)         # [B, 1, D]
-            output, _ = self.domain_attn(Q, K, V)         # [B, 1, D]
-        return output.squeeze(1)                      # [B, D]
+            output, _ = self.domain_attn(Q, K, V)         # [B, 1, D]"""
+            domain_bias = self.domain_emb(domain_idx)  # [B, D]
+            output = UI_aggregation_e + domain_bias
+            return output.squeeze(1)                      # [B, D]
 
     def calculate_loss(self, interaction):
-        r"""Data processing and call function forward(), return loss
-
-        To use CDCDR, a user must have a historical transaction record,
-        a pos item and a sequence of neg items. Based on the RecBole
-        framework, the data in the interaction object is ordered, so
-        we can get the data quickly.
+        r"""
+        Data processing and call function forward(), return loss
         """
 
         user_id = [interaction[self.SOURCE_USER_ID],interaction[self.TARGET_USER_ID]]#source, target
@@ -650,114 +558,53 @@ class CDCDR(CrossDomainRecommender):
 
             t_history_item = self.history_item_id[1][user]      # [B, L]
             t_history_len = self.history_item_len[1][user]      # [B]
-            # Remove pos_item from other history
+            # Remove pos_item from history
             t_history_item, t_history_len = remove_pos_from_history(pos_item, t_history_item, t_history_len)
-
-            """# 动态裁剪：移除 timestamp >= 当前时间的历史
-            t_timestamp = interaction['target_timestamp'] # [B * neg_seq_len]
-            t_timestamp = t_timestamp[:user_number]  # [B] ← 关键：取每个用户的当前时间戳
-            t_history_ts = self.history_timestamp[1][user]      # [B, L]
-            t_history_item, t_history_len = temporal_mask_history(
-                t_history_item, t_history_ts, t_history_len, t_timestamp
-            )"""
 
             # Aggregated Domain-Specific Interactions
             s_UI_aggregation_e = self.get_user_representation(user, s_history_item, s_history_len) # [B, D]
             t_UI_aggregation_e = self.get_user_representation(user, t_history_item, t_history_len) # [B, D]
             pos_item_e = self.item_emb(pos_item)  # [B, D]
 
-            """# Domain condition generator
-            gate = torch.sigmoid(self.gate_proj(torch.cat([s_UI_aggregation_e, t_UI_aggregation_e], dim=-1)))
-            UI_aggregation_e = gate * s_UI_aggregation_e + (1 - gate) * t_UI_aggregation_e  # [B, D]
-            domain_idx = torch.full_like(user, domain)  # [B], e.g., all 0 for source
-            UI_aggregation_e = self.domain_condition_generator(UI_aggregation_e, domain_idx)  # [B, D]"""
-            UI_aggregation_e = t_UI_aggregation_e if domain ==1 else s_UI_aggregation_e
+            # Domain condition generator
+            UI_aggregation_e = self.domain_condition_generator(s_UI_aggregation_e, t_UI_aggregation_e, domain)  # [B, D]
 
-            if self.simple:
-                neg_item_seq_e = self.item_emb(neg_item_seq)  # [B, neg_seq_len, D]
-                pos_item_score = torch.mul(UI_aggregation_e.unsqueeze(1), pos_item_e.unsqueeze(1)).sum(dim=2)
-                neg_item_score = torch.mul(UI_aggregation_e.unsqueeze(1), neg_item_seq_e).sum(dim=2)
-                
-                if self.loss_n == 'bce':
-                    pos_label = torch.ones_like(pos_item_score)
-                    neg_label = torch.zeros_like(neg_item_score)
-                    loss = self.bceloss(self.sigmoid(pos_item_score), pos_label) + \
-                        self.bceloss(self.sigmoid(neg_item_score), neg_label)
-                elif self.loss_n == 'bpr':
-                    loss = self.bprloss(pos_item_score, neg_item_score)
-                elif self.loss_n == 'mse':
-                    pos_label = torch.ones_like(pos_item_score)
-                    neg_label = torch.zeros_like(neg_item_score)
-                    loss = self.mseloss(pos_item_score, pos_label) + \
-                        self.mseloss(neg_item_score, neg_label)
-                elif self.loss_n == 'ccl':
-                    pos_cos = self.get_cos(UI_aggregation_e, pos_item_e.unsqueeze(1))
-                    neg_cos = self.get_cos(UI_aggregation_e, neg_item_seq_e)
-                    pos_loss = torch.relu(1 - pos_cos)
-                    #margin: 0.5, negative_weight: 10
-                    neg_loss = torch.relu(neg_cos - 0.5) * 10
-                    loss = pos_loss.mean() + neg_loss.mean()
-            else:
-                x_start, predicted_x = self.run_diffusion_process(pos_item_e, UI_aggregation_e)
-                if self.loss_type == 'l1':
-                    loss = F.l1_loss(x_start, predicted_x)
-                elif self.loss_type == 'l2':
-                    loss = F.mse_loss(x_start, predicted_x)
-                elif self.loss_type == "huber":
-                    loss = F.smooth_l1_loss(x_start, predicted_x)
-                else:
-                    raise NotImplementedError()
+            neg_item_seq_e = self.item_emb(neg_item_seq)  # [B, neg_seq_len, D]
+            pos_item_score = torch.mul(UI_aggregation_e.unsqueeze(1), pos_item_e.unsqueeze(1)).sum(dim=2)
+            neg_item_score = torch.mul(UI_aggregation_e.unsqueeze(1), neg_item_seq_e).sum(dim=2)
+            
+            if self.loss_n == 'bce':
+                pos_label = torch.ones_like(pos_item_score)
+                neg_label = torch.zeros_like(neg_item_score)
+                loss = self.bceloss(self.sigmoid(pos_item_score), pos_label) + \
+                    self.bceloss(self.sigmoid(neg_item_score), neg_label)
+            elif self.loss_n == 'bpr':
+                loss = self.bprloss(pos_item_score, neg_item_score)
+            elif self.loss_n == 'mse':
+                loss = self.mseloss(UI_aggregation_e, pos_item_e)
+            x_start, predicted_x = self.run_diffusion_process(pos_item_e, UI_aggregation_e)
+            loss += F.mse_loss(x_start, predicted_x)
             losses.append(loss)
+        #return_loss = losses[0]
         return_loss = 0.2 * losses[0] + 0.8 * losses[1]
         return return_loss
 
-    def predict(self, interaction):
-        user = interaction[self.TARGET_USER_ID]
-        history_item = self.history_item_id[1][user]      # [B, L]
-        history_len = self.history_item_len[1][user]      # [B]
-
-        """# 动态裁剪：移除 timestamp >= 当前时间的历史
-        timestamp = interaction['timestamp']  # [B] ← 关键：取每个用户的当前时间戳
-        history_ts = self.history_timestamp[user]      # [B, L]
-        history_item, history_len = temporal_mask_history(
-            history_item, history_ts, history_len, timestamp
-        )"""
-
-        UI_aggregation_e = self.get_user_representation(user, history_item, history_len)
-        h = UI_aggregation_e
-        x = self.sample_from_noise(self.denoise_step, self.denoise_uncon, h)
-
-        test_item = interaction[self.TARGET_ITEM_ID]
-        UI_cos = self.get_cos(x, self.item_emb(test_item).unsqueeze(1))
-        return UI_cos.squeeze(1)
-
     def full_sort_predict(self, interaction):
         user = interaction[self.TARGET_USER_ID]
-        history_item = self.history_item_id[1][user]      # [B, L]
-        history_len = self.history_item_len[1][user]      # [B]
+        s_history_item = self.history_item_id[0][user]      # [B, L]
+        s_history_len = self.history_item_len[0][user]      # [B]
+        t_history_item = self.history_item_id[1][user]      # [B, L]
+        t_history_len = self.history_item_len[1][user]      # [B]
+        # no need remove pos_item from history because history only contains training interactions
+        s_UI_aggregation_e = self.get_user_representation(user, s_history_item, s_history_len) # [B, D]
+        t_UI_aggregation_e = self.get_user_representation(user, t_history_item, t_history_len) # [B, D]
+        # Domain condition generator
+        UI_aggregation_e = self.domain_condition_generator(s_UI_aggregation_e, t_UI_aggregation_e, 1)  # [B, D]
 
-        """# 动态裁剪：移除 timestamp >= 当前时间的历史
-        timestamp = interaction['timestamp']  # [B] ← 关键：取每个用户的当前时间戳
-        history_ts = self.history_timestamp[user]      # [B, L]
-        history_item, history_len = temporal_mask_history(
-            history_item, history_ts, history_len, timestamp
-        )"""
-
-        UI_aggregation_e = self.get_user_representation(user, history_item, history_len)
-        if self.simple:
-            x = UI_aggregation_e
-        else:
-            ## Edit from DreamRec
-            h = UI_aggregation_e ## History as condition
-            x = self.sample_from_noise(self.denoise_step, self.denoise_uncon, h)
+        #UI_aggregation_e = t_UI_aggregation_e
+        x = self.sample_from_noise(self.denoise_step, self.denoise_uncon, UI_aggregation_e)
 
         all_item_emb = self.item_emb.weight
         target_all_item_emb = all_item_emb[:self.target_num_items]
-        II_cos = torch.matmul(x, target_all_item_emb.T)
-        return II_cos
-        
-        #TODO: 要不要norm？
-        x = F.normalize(x, dim=1)
-        target_all_item_emb = F.normalize(target_all_item_emb, dim=1)
         II_cos = torch.matmul(x, target_all_item_emb.T)
         return II_cos
